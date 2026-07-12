@@ -46,13 +46,13 @@ ai-coding-agent/
 ### Option A — Install from GitHub (recommended for end users)
 
 ```bash
-pip install git+https://github.com/YOUR_USERNAME/ai-coding-agent.git
+pip install git+https://github.com/ahmadalip/ai-coding-agent.git
 ```
 
 ### Option B — Clone and install locally (for development)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-coding-agent.git
+git clone https://github.com/ahmadalip/ai-coding-agent.git
 cd ai-coding-agent
 pip install .
 ```
@@ -60,7 +60,7 @@ pip install .
 ### Option C — Editable install (for contributors)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-coding-agent.git
+git clone https://github.com/ahmadalip/ai-coding-agent.git
 cd ai-coding-agent
 pip install -e .
 ```
