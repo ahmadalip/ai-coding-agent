@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "ai-coding-agent"
+version = "0.1.0"
+description = "A CLI-based AI coding agent powered by OpenAI — your terminal-native pair programmer."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+
+authors = [
+  { name = "Your Name", email = "you@example.com" }
+]
+
+keywords = ["ai", "coding", "agent", "openai", "cli", "developer-tools"]
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Code Generators",
+]
+
+dependencies = [
+  "openai>=1.35.0,<2.0.0",
+  "typer>=0.12.0,<1.0.0",
+  "rich>=13.7.0,<14.0.0",
+  "pydantic>=2.7.0,<3.0.0",
+]
+
+[project.scripts]
+# After `pip install .` users run the agent with `aicoder`
+aicoder = "ai_agent.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/ai-coding-agent"
+Repository = "https://github.com/YOUR_USERNAME/ai-coding-agent"
+Issues = "https://github.com/YOUR_USERNAME/ai-coding-agent/issues"
+
+[tool.setuptools.packages.find]
+# Automatically discover all packages under the project root
+where = ["."]
+include = ["ai_agent*"]
+
+[tool.setuptools.package-data]
+"ai_agent" = ["py.typed"]
