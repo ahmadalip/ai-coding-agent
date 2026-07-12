@@ -159,28 +159,46 @@ def _model_picker(cfg: AgentConfig) -> AgentConfig:
     provider = chosen["provider"]
     provider_style = PROVIDER_STYLE.get(provider, "white")
 
-    # Check the right key exists for this provider
-    if provider == "DeepSeek" and not cfg.deepseek_api_key:
+    # ── Always ask for the API key when switching models ───────────────────
+    # Show the masked current key as a hint so user knows one is already set.
+    if provider == "DeepSeek":
+        current_key = cfg.deepseek_api_key or ""
+        masked = (current_key[:4] + "••••" + current_key[-4:]) if len(current_key) > 8 else ""
+        hint = f" [dim](current: {masked})[/dim]" if masked else " [dim](not set)[/dim]"
         console.print(
-            f"\n[bold yellow]DeepSeek key not set.[/] "
-            "Enter it now or press Enter to cancel."
+            f"\n[bold cyan]DeepSeek API key{hint}[/]\n"
+            "[dim]Press Enter to keep the current key, or paste a new one.[/dim]"
         )
-        key = Prompt.ask("[bold yellow]DeepSeek API key[/]", password=True, default="")
-        if not key:
-            console.print("[dim]Model switch cancelled.[/dim]")
+        key = Prompt.ask(
+            "[bold yellow]DeepSeek API key[/]",
+            password=True,
+            default="",
+        )
+        if key:
+            cfg = update_config(deepseek_api_key=key)
+        elif not current_key:
+            # No key at all — cannot proceed
+            console.print("[bold red]✗ No DeepSeek API key set. Model switch cancelled.[/]")
             return cfg
-        cfg = update_config(deepseek_api_key=key)
 
-    elif provider == "OpenAI" and not cfg.api_key:
+    else:  # OpenAI
+        current_key = cfg.api_key or ""
+        masked = (current_key[:4] + "••••" + current_key[-4:]) if len(current_key) > 8 else ""
+        hint = f" [dim](current: {masked})[/dim]" if masked else " [dim](not set)[/dim]"
         console.print(
-            "\n[bold yellow]OpenAI key not set.[/] "
-            "Enter it now or press Enter to cancel."
+            f"\n[bold cyan]OpenAI API key{hint}[/]\n"
+            "[dim]Press Enter to keep the current key, or paste a new one.[/dim]"
         )
-        key = Prompt.ask("[bold yellow]OpenAI API key[/]", password=True, default="")
-        if not key:
-            console.print("[dim]Model switch cancelled.[/dim]")
+        key = Prompt.ask(
+            "[bold yellow]OpenAI API key[/]",
+            password=True,
+            default="",
+        )
+        if key:
+            cfg = update_config(api_key=key)
+        elif not current_key:
+            console.print("[bold red]✗ No OpenAI API key set. Model switch cancelled.[/]")
             return cfg
-        cfg = update_config(api_key=key)
 
     # Switch the model
     cfg = update_config(model=chosen["id"], base_url=chosen["base_url"])
