@@ -42,6 +42,7 @@ from ai_agent import __version__
 from ai_agent.config import (
     MODELS,
     AgentConfig,
+    ask_api_key,
     get_model_info,
     load_config,
     print_models_table,
@@ -169,11 +170,7 @@ def _model_picker(cfg: AgentConfig) -> AgentConfig:
             f"\n[bold cyan]DeepSeek API key{hint}[/]\n"
             "[dim]Press Enter to keep the current key, or paste a new one.[/dim]"
         )
-        key = Prompt.ask(
-            "[bold yellow]DeepSeek API key[/]",
-            password=True,
-            default="",
-        )
+        key = ask_api_key("DeepSeek API key:", console)
         if key:
             cfg = update_config(deepseek_api_key=key)
         elif not current_key:
@@ -189,11 +186,7 @@ def _model_picker(cfg: AgentConfig) -> AgentConfig:
             f"\n[bold cyan]OpenAI API key{hint}[/]\n"
             "[dim]Press Enter to keep the current key, or paste a new one.[/dim]"
         )
-        key = Prompt.ask(
-            "[bold yellow]OpenAI API key[/]",
-            password=True,
-            default="",
-        )
+        key = ask_api_key("OpenAI API key:", console)
         if key:
             cfg = update_config(api_key=key)
         elif not current_key:
@@ -267,14 +260,12 @@ def _handle_slash(
 def _update_keys_wizard(cfg: AgentConfig) -> AgentConfig:
     """Prompt the user to update one or both API keys."""
     console.print("\n[bold cyan]Update API Keys[/] [dim](press Enter to keep current)[/]\n")
-    openai_key = Prompt.ask(
-        "[bold yellow]OpenAI API key[/]", password=True, default=cfg.api_key or ""
+    openai_key = ask_api_key("OpenAI API key   :", console)
+    deepseek_key = ask_api_key("DeepSeek API key :", console)
+    cfg = update_config(
+        api_key=openai_key or cfg.api_key,
+        deepseek_api_key=deepseek_key or cfg.deepseek_api_key,
     )
-    deepseek_key = Prompt.ask(
-        "[bold yellow]DeepSeek API key[/]", password=True, default=cfg.deepseek_api_key or ""
-    )
-    cfg = update_config(api_key=openai_key or cfg.api_key,
-                        deepseek_api_key=deepseek_key or cfg.deepseek_api_key)
     console.print("[bold green]✓ Keys updated.[/]\n")
     return cfg
 

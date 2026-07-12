@@ -11,6 +11,7 @@ Supported providers: OpenAI, DeepSeek
 """
 
 import json
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +20,33 @@ from rich.console import Console
 from rich.prompt import Prompt
 from rich.table import Table
 from rich import box
+
+# ---------------------------------------------------------------------------
+# Portable API-key input  (Ctrl+V paste works on Windows)
+# ---------------------------------------------------------------------------
+
+def ask_api_key(prompt_text: str, console: Optional[Console] = None) -> str:
+    """
+    Prompt the user for an API key in a way that supports Ctrl+V paste on
+    Windows CMD / PowerShell.
+
+    Rich's Prompt.ask(password=True) uses getpass under the hood which
+    blocks paste on Windows.  We instead print the prompt ourselves and
+    read a plain line — the key is never echoed char-by-char, but the
+    whole pasted value arrives correctly.
+
+    The input IS visible while typing (no masking), which is the trade-off
+    for paste support.  The saved/displayed value is still masked.
+    """
+    if console is None:
+        console = Console()
+    console.print(f"[bold yellow]{prompt_text}[/] ", end="")
+    try:
+        key = input().strip()
+    except (KeyboardInterrupt, EOFError):
+        key = ""
+    return key
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -204,16 +232,8 @@ def _first_time_setup() -> AgentConfig:
     # Show model table so user can decide
     print_models_table(console)
 
-    openai_key = Prompt.ask(
-        "\n[bold yellow]OpenAI API key[/] [dim](press Enter to skip)[/]",
-        password=True,
-        default="",
-    )
-    deepseek_key = Prompt.ask(
-        "[bold yellow]DeepSeek API key[/] [dim](press Enter to skip)[/]",
-        password=True,
-        default="",
-    )
+    openai_key = ask_api_key("OpenAI API key      (press Enter to skip):", console)
+    deepseek_key = ask_api_key("DeepSeek API key    (press Enter to skip):", console)
 
     # Default model based on which key was provided
     if openai_key:
