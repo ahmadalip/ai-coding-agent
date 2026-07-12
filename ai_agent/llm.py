@@ -15,7 +15,7 @@ Agentic loop:
 import json
 from typing import Generator
 
-from openai import OpenAI, AuthenticationError, APIConnectionError, RateLimitError
+from openai import OpenAI, AuthenticationError, APIConnectionError, RateLimitError, BadRequestError
 from rich.console import Console
 from rich.live import Live
 from rich.spinner import Spinner
@@ -94,33 +94,59 @@ def _chat_completion(client: OpenAI, cfg: AgentConfig, messages: list[dict]):
     """
     Call the Chat Completions endpoint and return the first choice message.
     Shows a spinner while waiting so the terminal never looks frozen.
+
+    Handles two quirks automatically:
+    - newer openai SDK uses max_completion_tokens instead of max_tokens
+    - o1 / deepseek-reasoner don't accept temperature
+    - retries without tools if the model rejects them (400)
     """
     use_tools = cfg.model not in NO_TOOL_MODELS
 
-    # DeepSeek Reasoner doesn't accept a temperature parameter
+    # Models that don't accept a temperature parameter
     no_temp_models = {"o1-preview", "o1-mini", "deepseek-reasoner"}
-    kwargs: dict = {
-        "model": cfg.model,
-        "messages": messages,
-        "max_tokens": cfg.max_tokens,
-    }
-    if cfg.model not in no_temp_models:
-        kwargs["temperature"] = cfg.temperature
-    if use_tools:
-        kwargs["tools"] = TOOLS_SCHEMA
-        kwargs["tool_choice"] = "auto"
+
+    def _build_kwargs(with_tools: bool) -> dict:
+        kw: dict = {
+            "model": cfg.model,
+            "messages": messages,
+            "max_completion_tokens": cfg.max_tokens,   # SDK ≥1.35 prefers this
+        }
+        if cfg.model not in no_temp_models:
+            kw["temperature"] = cfg.temperature
+        if with_tools and use_tools:
+            kw["tools"] = TOOLS_SCHEMA
+            kw["tool_choice"] = "auto"
+        return kw
 
     spinner = Spinner("dots2", text=Text("  Thinking…", style="bold cyan"))
     with Live(spinner, console=console, refresh_per_second=15, transient=True):
         try:
-            response = client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**_build_kwargs(with_tools=True))
+
+        except BadRequestError as exc:
+            # Some models reject tools or max_completion_tokens — retry bare
+            err_body = str(exc).lower()
+            if "tool" in err_body or "function" in err_body or "max_completion_tokens" in err_body:
+                # Fallback 1: try with max_tokens instead
+                kw = _build_kwargs(with_tools=False)
+                kw.pop("max_completion_tokens", None)
+                kw["max_tokens"] = cfg.max_tokens
+                try:
+                    response = client.chat.completions.create(**kw)
+                except BadRequestError as exc2:
+                    raise RuntimeError(
+                        f"Model '{cfg.model}' rejected the request: {exc2}"
+                    ) from exc2
+            else:
+                raise RuntimeError(f"Bad request: {exc}") from exc
+
         except AuthenticationError:
             raise ValueError(
                 "Invalid API key. Run `aicoder config` to update your credentials."
             )
         except APIConnectionError as exc:
             raise ConnectionError(
-                f"Could not reach the API ({cfg.base_url}): {exc}"
+                f"Could not reach the API: {exc}"
             ) from exc
         except RateLimitError:
             raise RuntimeError(
