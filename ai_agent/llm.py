@@ -1,21 +1,24 @@
 """
 llm.py
 ------
-OpenAI-compatible client wrapper and the core agentic loop.
+OpenAI-compatible client + agentic loop with streaming final reply.
 
-Works with both OpenAI and DeepSeek (DeepSeek uses the same
-OpenAI SDK — just a different base_url and api_key).
-
-Agentic loop:
-  1. Send full conversation history to the model.
-  2. If the model returns tool calls → execute them, append results, loop.
-  3. If the model returns plain text → task complete, return to caller.
+Flow:
+  1. Send history to model.
+  2. Tool calls → execute with animated spinners → loop.
+  3. Final text reply → stream token-by-token via a generator.
 """
 
 import json
-from typing import Generator
+from typing import Generator, Iterator
 
-from openai import OpenAI, AuthenticationError, APIConnectionError, RateLimitError, BadRequestError
+from openai import (
+    OpenAI,
+    AuthenticationError,
+    APIConnectionError,
+    RateLimitError,
+    BadRequestError,
+)
 from rich.console import Console
 from rich.live import Live
 from rich.spinner import Spinner
@@ -33,128 +36,131 @@ console = Console()
 SYSTEM_PROMPT = """\
 You are an expert AI coding assistant running inside a developer's terminal.
 
-Your capabilities:
+Capabilities:
 - Read, create, edit, and delete files on the local file system.
 - List directory trees to understand project structure.
 - Write clean, well-commented, production-quality code.
 - Explain code, debug issues, suggest improvements.
 
-Behaviour rules:
-1. At the start of every new task, call list_files('.') to understand the
-   project layout before making any changes.
-2. Always call read_file before editing a file — never guess the content.
-3. Be concise in text replies; put the detail in code and comments.
-4. Work through multi-step tasks tool-by-tool, then give a short summary.
-5. If a model does not support tool/function calling (e.g. o1-preview,
-   deepseek-reasoner) just answer in plain text — do not attempt tool calls.
+Rules:
+1. At the start of every new task call list_files('.') first.
+2. Always call read_file before editing — never guess file content.
+3. In your FINAL text reply: never include raw code blocks.
+   Instead describe what you did and which files were changed.
+   All code belongs in files, not in the chat.
+4. Work tool-by-tool for multi-step tasks, then give a short plain-text summary.
+5. Models without tool support (o1-preview, deepseek-reasoner) answer in plain text.
 """
 
 # ---------------------------------------------------------------------------
-# Models that do NOT support function/tool calling
+# Models with no tool / no temperature support
 # ---------------------------------------------------------------------------
 
-NO_TOOL_MODELS = {
-    "o1-preview",
-    "o1-mini",
-    "deepseek-reasoner",
-}
-
+NO_TOOL_MODELS = {"o1-preview", "o1-mini", "deepseek-reasoner"}
+NO_TEMP_MODELS = {"o1-preview", "o1-mini", "deepseek-reasoner"}
 
 # ---------------------------------------------------------------------------
-# Client factory — auto-selects base_url and api_key by model provider
+# Client factory
 # ---------------------------------------------------------------------------
 
 def build_client(cfg: AgentConfig) -> OpenAI:
-    """
-    Create an OpenAI-SDK client pointed at the right provider.
-
-    - OpenAI models  → api.openai.com,   uses cfg.api_key
-    - DeepSeek models → api.deepseek.com, uses cfg.deepseek_api_key
-    """
-    api_key = cfg.active_api_key()
+    api_key  = cfg.active_api_key()
     base_url = get_base_url(cfg.model)
 
     if not api_key:
-        info = get_model_info(cfg.model)
+        info     = get_model_info(cfg.model)
         provider = info["provider"] if info else "OpenAI"
-        key_field = "OpenAI API key" if provider == "OpenAI" else "DeepSeek API key"
-        raise ValueError(
-            f"No {key_field} set for model '{cfg.model}'. "
-            f"Run `aicoder config` to add it."
-        )
+        field    = "OpenAI API key" if provider == "OpenAI" else "DeepSeek API key"
+        raise ValueError(f"No {field} for '{cfg.model}'. Run `aicoder config`.")
 
     return OpenAI(api_key=api_key, base_url=base_url)
 
-
 # ---------------------------------------------------------------------------
-# Single model call (with Rich spinner)
+# Single non-streaming call (used for tool-call turns only)
 # ---------------------------------------------------------------------------
 
-def _chat_completion(client: OpenAI, cfg: AgentConfig, messages: list[dict]):
+def _call(client: OpenAI, cfg: AgentConfig, messages: list[dict], with_tools: bool = True):
     """
-    Call the Chat Completions endpoint and return the first choice message.
-    Shows a spinner while waiting so the terminal never looks frozen.
-
-    Handles two quirks automatically:
-    - newer openai SDK uses max_completion_tokens instead of max_tokens
-    - o1 / deepseek-reasoner don't accept temperature
-    - retries without tools if the model rejects them (400)
+    One blocking call — only used while the model is still issuing tool calls.
+    Shows a 'Thinking…' spinner.
     """
-    use_tools = cfg.model not in NO_TOOL_MODELS
+    use_tools = with_tools and cfg.model not in NO_TOOL_MODELS
 
-    # Models that don't accept a temperature parameter
-    no_temp_models = {"o1-preview", "o1-mini", "deepseek-reasoner"}
-
-    def _build_kwargs(with_tools: bool) -> dict:
-        kw: dict = {
-            "model": cfg.model,
-            "messages": messages,
-            "max_completion_tokens": cfg.max_tokens,   # SDK ≥1.35 prefers this
-        }
-        if cfg.model not in no_temp_models:
+    def _kw(tools: bool) -> dict:
+        kw: dict = {"model": cfg.model, "messages": messages}
+        # Try max_completion_tokens first (newer SDK), fall back to max_tokens
+        kw["max_completion_tokens"] = cfg.max_tokens
+        if cfg.model not in NO_TEMP_MODELS:
             kw["temperature"] = cfg.temperature
-        if with_tools and use_tools:
-            kw["tools"] = TOOLS_SCHEMA
+        if tools:
+            kw["tools"]       = TOOLS_SCHEMA
             kw["tool_choice"] = "auto"
         return kw
 
     spinner = Spinner("dots2", text=Text("  Thinking…", style="bold cyan"))
     with Live(spinner, console=console, refresh_per_second=15, transient=True):
         try:
-            response = client.chat.completions.create(**_build_kwargs(with_tools=True))
+            return client.chat.completions.create(**_kw(use_tools)).choices[0].message
 
         except BadRequestError as exc:
-            # Some models reject tools or max_completion_tokens — retry bare
-            err_body = str(exc).lower()
-            if "tool" in err_body or "function" in err_body or "max_completion_tokens" in err_body:
-                # Fallback 1: try with max_tokens instead
-                kw = _build_kwargs(with_tools=False)
+            err = str(exc).lower()
+            if any(k in err for k in ("tool", "function", "max_completion_tokens")):
+                kw = _kw(False)
                 kw.pop("max_completion_tokens", None)
                 kw["max_tokens"] = cfg.max_tokens
                 try:
-                    response = client.chat.completions.create(**kw)
+                    return client.chat.completions.create(**kw).choices[0].message
                 except BadRequestError as exc2:
-                    raise RuntimeError(
-                        f"Model '{cfg.model}' rejected the request: {exc2}"
-                    ) from exc2
-            else:
-                raise RuntimeError(f"Bad request: {exc}") from exc
+                    raise RuntimeError(f"Model rejected request: {exc2}") from exc2
+            raise RuntimeError(f"Bad request: {exc}") from exc
 
         except AuthenticationError:
-            raise ValueError(
-                "Invalid API key. Run `aicoder config` to update your credentials."
-            )
+            raise ValueError("Invalid API key. Run `aicoder config`.")
         except APIConnectionError as exc:
-            raise ConnectionError(
-                f"Could not reach the API: {exc}"
-            ) from exc
+            raise ConnectionError(f"Cannot reach API: {exc}") from exc
         except RateLimitError:
-            raise RuntimeError(
-                "Rate limit hit. Wait a moment or switch to a cheaper model (/model)."
-            )
+            raise RuntimeError("Rate limit hit. Try /model to switch.")
 
-    return response.choices[0].message
+# ---------------------------------------------------------------------------
+# Streaming call — yields text tokens for the final reply
+# ---------------------------------------------------------------------------
 
+def _stream(client: OpenAI, cfg: AgentConfig, messages: list[dict]) -> Iterator[str]:
+    """
+    Stream the final assistant reply token-by-token.
+    Only called when the model returns no tool calls.
+    """
+    kw: dict = {
+        "model":    cfg.model,
+        "messages": messages,
+        "stream":   True,
+    }
+    # Use whichever token param the SDK accepts
+    try:
+        kw["max_completion_tokens"] = cfg.max_tokens
+        if cfg.model not in NO_TEMP_MODELS:
+            kw["temperature"] = cfg.temperature
+
+        for chunk in client.chat.completions.create(**kw):
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                yield delta.content
+
+    except BadRequestError:
+        # Retry with legacy max_tokens
+        kw.pop("max_completion_tokens", None)
+        kw["max_tokens"] = cfg.max_tokens
+        for chunk in client.chat.completions.create(**kw):
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                yield delta.content
+
+    except AuthenticationError:
+        raise ValueError("Invalid API key. Run `aicoder config`.")
+    except APIConnectionError as exc:
+        raise ConnectionError(f"Cannot reach API: {exc}") from exc
+    except RateLimitError:
+        raise RuntimeError("Rate limit hit. Try /model to switch.")
 
 # ---------------------------------------------------------------------------
 # Agentic loop
@@ -164,82 +170,92 @@ def run_agent(
     cfg: AgentConfig,
     user_message: str,
     history: list[dict],
-) -> tuple[str, list[dict]]:
+) -> tuple[Iterator[str], list[dict]]:
     """
-    Run the full agentic loop for one user turn.
-
-    Parameters
-    ----------
-    cfg          : AgentConfig — current settings
-    user_message : str         — what the user typed
-    history      : list[dict]  — full conversation history (mutated in-place)
+    Run the agentic loop.
 
     Returns
     -------
-    (final_reply, updated_history)
+    (token_stream, updated_history)
+        token_stream  : iterator that yields text tokens of the final reply
+        updated_history : history with all turns appended
     """
     client = build_client(cfg)
 
-    # Ensure system message is at position 0
     if not history or history[0].get("role") != "system":
         history.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
     history.append({"role": "user", "content": user_message})
 
     max_iterations = 20
-    iteration = 0
 
-    while iteration < max_iterations:
-        iteration += 1
-        message = _chat_completion(client, cfg, history)
+    for iteration in range(max_iterations):
+        message = _call(client, cfg, history)
 
-        # ── Case 1: model wants to call tools ──────────────────────────────
+        # ── Tool calls ──────────────────────────────────────────────────────
         if getattr(message, "tool_calls", None):
-            history.append(_message_to_dict(message))
+            history.append(_to_dict(message))
 
-            for tool_call in message.tool_calls:
-                name = tool_call.function.name
+            for tc in message.tool_calls:
+                name = tc.function.name
                 try:
-                    args = json.loads(tool_call.function.arguments)
+                    args = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
                     args = {}
 
+                # Tool header line
+                file_target = (
+                    args.get("file_path")
+                    or args.get("directory")
+                    or ""
+                )
                 console.print(
-                    f"\n[bold magenta]⚙  Tool call:[/] [cyan]{name}[/] "
-                    f"[dim]{_summarise_args(args)}[/dim]"
+                    Text.assemble(
+                        ("\n  ⚙  ", "bold magenta"),
+                        (name.replace("_", " ").title(), "bold cyan"),
+                        (" → ", "dim"),
+                        (file_target, "cyan"),
+                    )
                 )
 
                 result = execute_tool(name, args)
 
-                history.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": name,
-                        "content": result,
-                    }
-                )
+                history.append({
+                    "role":        "tool",
+                    "tool_call_id": tc.id,
+                    "name":        name,
+                    "content":     result,
+                })
 
-        # ── Case 2: plain text reply — done ───────────────────────────────
+        # ── Final text reply — stream it ────────────────────────────────────
         else:
-            final_text = message.content or ""
-            history.append({"role": "assistant", "content": final_text})
-            return final_text, history
+            # We need to collect the full text too so we can append to history
+            def _collecting_stream() -> Iterator[str]:
+                collected: list[str] = []
+                for token in _stream(client, cfg, history):
+                    collected.append(token)
+                    yield token
+                history.append({
+                    "role":    "assistant",
+                    "content": "".join(collected),
+                })
 
-    fallback = (
-        "I hit the maximum tool-call limit (20). "
-        "Please break your request into smaller steps."
-    )
+            return _collecting_stream(), history
+
+    # Safety cap
+    fallback = "Reached max tool iterations. Please break the task into smaller steps."
     history.append({"role": "assistant", "content": fallback})
-    return fallback, history
 
+    def _fallback_stream() -> Iterator[str]:
+        yield fallback
+
+    return _fallback_stream(), history
 
 # ---------------------------------------------------------------------------
-# Helper utilities
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _message_to_dict(message) -> dict:
-    """Convert an OpenAI ChatCompletionMessage object to a serialisable dict."""
+def _to_dict(message) -> dict:
     d: dict = {"role": message.role}
     if message.content:
         d["content"] = message.content
@@ -249,20 +265,10 @@ def _message_to_dict(message) -> dict:
                 "id": tc.id,
                 "type": "function",
                 "function": {
-                    "name": tc.function.name,
+                    "name":      tc.function.name,
                     "arguments": tc.function.arguments,
                 },
             }
             for tc in message.tool_calls
         ]
     return d
-
-
-def _summarise_args(args: dict) -> str:
-    """Short human-readable summary of tool call arguments."""
-    parts = []
-    for k, v in args.items():
-        if isinstance(v, str) and len(v) > 60:
-            v = v[:57] + "…"
-        parts.append(f"{k}={repr(v)}")
-    return ", ".join(parts)

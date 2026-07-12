@@ -1,169 +1,216 @@
 """
 tools.py
 --------
-File-system tools exposed to the AI via OpenAI function calling.
+File-system tools with animated spinners for every operation.
 
-Each tool is defined in two places:
-  1. A plain Python function that does the actual work.
-  2. A JSON schema entry in TOOLS_SCHEMA that OpenAI uses to decide when/how
-     to call the function.
-
-The dispatch helper ``execute_tool`` routes a tool-call from the model to
-the correct Python function and returns a string result that is fed back into
-the conversation as a "tool" role message.
+Each tool shows:
+  ⟳  <verb> <filename>...   (spinner while working)
+  ✓  <verb> <filename>      (green on success)
+  ✗  <verb> <filename>      (red on failure)
 """
 
-import os
 import shutil
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.live import Live
 from rich.prompt import Confirm
+from rich.spinner import Spinner
 from rich.syntax import Syntax
+from rich.text import Text
 
 console = Console()
 
 # ---------------------------------------------------------------------------
-# Individual tool implementations
+# Animated operation context manager
+# ---------------------------------------------------------------------------
+
+TOOL_ICONS = {
+    "create":  ("📝", "Creating",   "Created"),
+    "edit":    ("✏️ ", "Editing",    "Edited"),
+    "delete":  ("🗑️ ", "Deleting",   "Deleted"),
+    "read":    ("📖", "Reading",    "Read"),
+    "list":    ("📁", "Scanning",   "Scanned"),
+}
+
+
+@contextmanager
+def _animated(verb: str, target: str):
+    """
+    Context manager that shows a spinner while the body runs, then
+    prints a clean ✓/✗ completion line.
+
+    Usage:
+        with _animated("create", "app.py") as status:
+            ... do work ...
+            # on error: raise an exception — ✗ will be shown automatically
+    """
+    icon, present, past = TOOL_ICONS.get(verb, ("⚙️ ", verb.capitalize() + "ing", verb.capitalize() + "ed"))
+    spinner_text = Text.assemble(
+        (f"  {icon}  ", ""),
+        (present + " ", "bold cyan"),
+        (target, "cyan"),
+        ("…", "dim"),
+    )
+    spinner = Spinner("dots2", text=spinner_text)
+
+    success = False
+    try:
+        with Live(spinner, console=console, refresh_per_second=15, transient=True):
+            yield
+        success = True
+    finally:
+        if success:
+            console.print(Text.assemble(
+                ("  ✓  ", "bold green"),
+                (past + " ", "green"),
+                (target, "bold cyan"),
+            ))
+        else:
+            console.print(Text.assemble(
+                ("  ✗  ", "bold red"),
+                ("Failed — ", "red"),
+                (target, "bold cyan"),
+            ))
+
+
+# ---------------------------------------------------------------------------
+# Tool implementations
 # ---------------------------------------------------------------------------
 
 def create_file(file_path: str, content: str) -> str:
-    """
-    Create a new file at *file_path* and write *content* into it.
-    Parent directories are created automatically.
-    Returns a human-readable status string.
-    """
     path = Path(file_path)
-    try:
+    name = path.name
+
+    with _animated("create", name):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        console.print(f"  [bold green]✓ Created[/] [cyan]{file_path}[/]")
-        return f"File '{file_path}' created successfully ({len(content)} chars)."
-    except Exception as exc:
-        console.print(f"  [bold red]✗ create_file failed:[/] {exc}")
-        return f"ERROR creating '{file_path}': {exc}"
+        lines = len(content.splitlines())
+
+    console.print(
+        f"    [dim]{file_path}[/dim]  "
+        f"[dim]{lines} lines · {len(content)} chars[/dim]"
+    )
+    return f"File '{file_path}' created successfully ({lines} lines, {len(content)} chars)."
 
 
 def edit_file(file_path: str, old_snippet: str, new_snippet: str) -> str:
-    """
-    Replace the first occurrence of *old_snippet* with *new_snippet* in the
-    file at *file_path*.
-
-    The AI should call read_file first so it has the exact current content
-    before constructing a diff.
-    """
     path = Path(file_path)
+    name = path.name
+
     if not path.exists():
         msg = f"ERROR: '{file_path}' does not exist. Use create_file first."
         console.print(f"  [bold red]✗[/] {msg}")
         return msg
 
     try:
-        original = path.read_text(encoding="utf-8")
-        if old_snippet not in original:
-            msg = (
-                f"ERROR: The specified snippet was not found in '{file_path}'. "
-                "Make sure you read the file first and copy the snippet exactly."
-            )
-            console.print(f"  [bold red]✗[/] {msg}")
-            return msg
+        with _animated("edit", name):
+            original = path.read_text(encoding="utf-8")
+            if old_snippet not in original:
+                raise ValueError("snippet not found")
+            updated = original.replace(old_snippet, new_snippet, 1)
+            path.write_text(updated, encoding="utf-8")
 
-        updated = original.replace(old_snippet, new_snippet, 1)
-        path.write_text(updated, encoding="utf-8")
-        console.print(f"  [bold green]✓ Edited[/] [cyan]{file_path}[/]")
-        return f"File '{file_path}' edited successfully."
+        added   = len(new_snippet.splitlines())
+        removed = len(old_snippet.splitlines())
+        console.print(
+            f"    [dim]{file_path}[/dim]  "
+            f"[green]+{added}[/green] [red]-{removed}[/red] [dim]lines[/dim]"
+        )
+        return f"File '{file_path}' edited successfully (+{added}/-{removed} lines)."
+
+    except ValueError:
+        msg = (
+            f"ERROR: Snippet not found in '{file_path}'. "
+            "Read the file first to get exact content."
+        )
+        console.print(f"  [bold red]✗[/] {msg}")
+        return msg
     except Exception as exc:
-        console.print(f"  [bold red]✗ edit_file failed:[/] {exc}")
         return f"ERROR editing '{file_path}': {exc}"
 
 
 def delete_file(file_path: str) -> str:
-    """
-    Delete the file (or empty directory) at *file_path*.
-    Always asks the user for y/n confirmation before proceeding.
-    """
     path = Path(file_path)
+    name = path.name
+
     if not path.exists():
         msg = f"ERROR: '{file_path}' does not exist."
         console.print(f"  [bold red]✗[/] {msg}")
         return msg
 
-    console.print(f"\n  [bold yellow]⚠  The AI wants to delete:[/] [cyan]{file_path}[/]")
+    console.print(
+        f"\n  [bold yellow]⚠  Delete request:[/] [cyan]{file_path}[/]"
+    )
     confirmed = Confirm.ask("  [bold red]Confirm deletion?[/]", default=False)
 
     if not confirmed:
-        console.print("  [dim]Deletion cancelled by user.[/]")
+        console.print("  [dim]Deletion cancelled.[/dim]")
         return f"Deletion of '{file_path}' was cancelled by the user."
 
-    try:
+    with _animated("delete", name):
         if path.is_dir():
             shutil.rmtree(path)
         else:
             path.unlink()
-        console.print(f"  [bold green]✓ Deleted[/] [cyan]{file_path}[/]")
-        return f"'{file_path}' deleted successfully."
-    except Exception as exc:
-        console.print(f"  [bold red]✗ delete_file failed:[/] {exc}")
-        return f"ERROR deleting '{file_path}': {exc}"
+
+    return f"'{file_path}' deleted successfully."
 
 
 def read_file(file_path: str) -> str:
-    """
-    Read and return the full content of *file_path*.
-    Also pretty-prints a syntax-highlighted preview in the terminal.
-    """
     path = Path(file_path)
+    name = path.name
+
     if not path.exists():
         msg = f"ERROR: '{file_path}' does not exist."
         console.print(f"  [bold red]✗[/] {msg}")
         return msg
 
-    try:
+    with _animated("read", name):
         content = path.read_text(encoding="utf-8")
-        # Determine lexer from extension for syntax highlighting
-        suffix = path.suffix.lstrip(".") or "text"
-        lexer_map = {
-            "py": "python", "js": "javascript", "ts": "typescript",
-            "json": "json", "yaml": "yaml", "yml": "yaml",
-            "md": "markdown", "html": "html", "css": "css",
-            "sh": "bash", "bash": "bash", "txt": "text",
-            "toml": "toml", "rs": "rust", "go": "go",
-        }
-        lexer = lexer_map.get(suffix, "text")
 
-        console.print(f"  [bold blue]📄 Reading[/] [cyan]{file_path}[/]")
-        # Show a condensed preview (first 60 lines) — full content goes to the model
-        preview_lines = content.splitlines()[:60]
-        preview = "\n".join(preview_lines)
-        if len(content.splitlines()) > 60:
-            preview += f"\n… ({len(content.splitlines()) - 60} more lines)"
-        console.print(Syntax(preview, lexer, theme="monokai", line_numbers=True))
+    # Show a compact syntax-highlighted preview (first 40 lines)
+    suffix = path.suffix.lstrip(".") or "text"
+    lexer_map = {
+        "py": "python", "js": "javascript", "ts": "typescript",
+        "json": "json", "yaml": "yaml", "yml": "yaml",
+        "md": "markdown", "html": "html", "css": "css",
+        "sh": "bash", "bash": "bash", "txt": "text",
+        "toml": "toml", "rs": "rust", "go": "go",
+    }
+    lexer = lexer_map.get(suffix, "text")
+    all_lines = content.splitlines()
+    preview = "\n".join(all_lines[:40])
+    if len(all_lines) > 40:
+        preview += f"\n  … {len(all_lines) - 40} more lines"
 
-        return content
-    except Exception as exc:
-        console.print(f"  [bold red]✗ read_file failed:[/] {exc}")
-        return f"ERROR reading '{file_path}': {exc}"
+    console.print(
+        Syntax(preview, lexer, theme="monokai", line_numbers=True,
+               background_color="default")
+    )
+    console.print(
+        f"    [dim]{file_path}[/dim]  [dim]{len(all_lines)} lines[/dim]"
+    )
+    return content
 
 
 def list_files(directory: str = ".") -> str:
-    """
-    Recursively list files and directories under *directory*, rendered as an
-    indented tree.  Returns the tree as a plain string for the model.
-    """
     root = Path(directory).resolve()
+
     if not root.exists():
         msg = f"ERROR: Directory '{directory}' does not exist."
         console.print(f"  [bold red]✗[/] {msg}")
         return msg
 
-    lines: list[str] = []
-
-    # Folders/files to skip (keep output clean)
     SKIP = {
         "__pycache__", ".git", ".venv", "venv", "node_modules",
-        ".mypy_cache", ".pytest_cache", "dist", "build", "*.egg-info",
+        ".mypy_cache", ".pytest_cache", "dist", "build",
     }
+
+    lines: list[str] = []
 
     def _should_skip(name: str) -> bool:
         return name in SKIP or name.endswith(".egg-info")
@@ -173,53 +220,37 @@ def list_files(directory: str = ".") -> str:
             entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name))
         except PermissionError:
             return
-
         entries = [e for e in entries if not _should_skip(e.name)]
         for i, entry in enumerate(entries):
             connector = "└── " if i == len(entries) - 1 else "├── "
             lines.append(f"{prefix}{connector}{entry.name}")
             if entry.is_dir():
-                extension = "    " if i == len(entries) - 1 else "│   "
-                _walk(entry, prefix + extension)
+                ext = "    " if i == len(entries) - 1 else "│   "
+                _walk(entry, prefix + ext)
 
-    lines.append(str(root))
-    _walk(root)
+    with _animated("list", str(root.name)):
+        lines.append(str(root))
+        _walk(root)
+
     tree_str = "\n".join(lines)
-
-    console.print(f"  [bold blue]📁 Listing[/] [cyan]{directory}[/]")
     console.print(f"[dim]{tree_str}[/dim]")
     return tree_str
 
 
 # ---------------------------------------------------------------------------
-# Tool registry — maps name → callable
+# Registry & dispatcher
 # ---------------------------------------------------------------------------
 
 TOOL_FUNCTIONS: dict[str, Any] = {
     "create_file": create_file,
-    "edit_file": edit_file,
+    "edit_file":   edit_file,
     "delete_file": delete_file,
-    "read_file": read_file,
-    "list_files": list_files,
+    "read_file":   read_file,
+    "list_files":  list_files,
 }
 
 
 def execute_tool(tool_name: str, tool_args: dict[str, Any]) -> str:
-    """
-    Dispatch a tool call from the model to the correct Python function.
-
-    Parameters
-    ----------
-    tool_name : str
-        The name returned by the model in the tool-call object.
-    tool_args : dict
-        The parsed JSON arguments from the model.
-
-    Returns
-    -------
-    str
-        A plain-text result that will be sent back as a ``tool`` role message.
-    """
     fn = TOOL_FUNCTIONS.get(tool_name)
     if fn is None:
         return f"ERROR: Unknown tool '{tool_name}'."
@@ -238,21 +269,12 @@ TOOLS_SCHEMA: list[dict] = [
         "type": "function",
         "function": {
             "name": "create_file",
-            "description": (
-                "Create a new file at the given path and write content into it. "
-                "Parent directories are created automatically."
-            ),
+            "description": "Create a new file with content. Parent dirs auto-created.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Relative or absolute path for the new file.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Full text content to write into the file.",
-                    },
+                    "file_path": {"type": "string", "description": "Path for the new file."},
+                    "content":   {"type": "string", "description": "Full file content."},
                 },
                 "required": ["file_path", "content"],
             },
@@ -262,25 +284,13 @@ TOOLS_SCHEMA: list[dict] = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": (
-                "Edit an existing file by replacing old_snippet with new_snippet. "
-                "Always call read_file first to get the exact current content."
-            ),
+            "description": "Replace old_snippet with new_snippet in a file. Call read_file first.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the file to edit.",
-                    },
-                    "old_snippet": {
-                        "type": "string",
-                        "description": "The exact text to be replaced (must match verbatim).",
-                    },
-                    "new_snippet": {
-                        "type": "string",
-                        "description": "The new text to substitute in place of old_snippet.",
-                    },
+                    "file_path":   {"type": "string", "description": "Path to the file."},
+                    "old_snippet": {"type": "string", "description": "Exact text to replace."},
+                    "new_snippet": {"type": "string", "description": "Replacement text."},
                 },
                 "required": ["file_path", "old_snippet", "new_snippet"],
             },
@@ -290,17 +300,11 @@ TOOLS_SCHEMA: list[dict] = [
         "type": "function",
         "function": {
             "name": "delete_file",
-            "description": (
-                "Delete a file or directory. The user will be asked to confirm "
-                "before deletion actually happens."
-            ),
+            "description": "Delete a file or directory. User confirmation required.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the file or directory to delete.",
-                    },
+                    "file_path": {"type": "string", "description": "Path to delete."},
                 },
                 "required": ["file_path"],
             },
@@ -314,10 +318,7 @@ TOOLS_SCHEMA: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the file to read.",
-                    },
+                    "file_path": {"type": "string", "description": "Path to read."},
                 },
                 "required": ["file_path"],
             },
@@ -327,17 +328,11 @@ TOOLS_SCHEMA: list[dict] = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": (
-                "List files and directories in a given directory as a tree. "
-                "Use '.' for the current working directory."
-            ),
+            "description": "List files as a tree. Use '.' for current directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "directory": {
-                        "type": "string",
-                        "description": "Directory path to list. Defaults to '.'.",
-                    },
+                    "directory": {"type": "string", "description": "Directory to list."},
                 },
                 "required": [],
             },
